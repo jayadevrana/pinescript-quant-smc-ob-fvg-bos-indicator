@@ -1,0 +1,141 @@
+//@version=6
+// =============================================================================
+//  Quant SMC — Order Blocks / Fair Value Gaps / Break of Structure
+//  Channel: Quant by Jayadev   |   Video 01
+//
+//  Educational content, NOT financial advice. Trading involves risk of loss.
+//  This indicator highlights structure; it does not predict price.
+// =============================================================================
+indicator("Quant SMC — OB / FVG / BOS", "Quant SMC", overlay = true,
+     max_boxes_count = 250, max_lines_count = 250, max_labels_count = 250)
+
+// ----------------------------- Inputs ---------------------------------------
+grpS = "Structure"
+// Swing lookback = how many bars sit on each side of a pivot before we trust it.
+// Higher number = fewer swings, but the ones you get are more meaningful.
+swingLen = input.int(10, "Swing lookback", minval = 2, maxval = 50, group = grpS,
+     tooltip = "Bars on each side of a pivot. Higher = fewer but stronger swings.")
+showBOS  = input.bool(true, "Show Break of Structure", group = grpS)
+
+grpZ = "Zones"
+showOB   = input.bool(true, "Show Order Blocks", group = grpZ)
+showFVG  = input.bool(true, "Show Fair Value Gaps", group = grpZ)
+// We only keep the most recent N zones of each type so the chart stays readable.
+maxZones = input.int(6, "Max zones kept per type", minval = 1, maxval = 30, group = grpZ,
+     tooltip = "Older zones are removed once this many are drawn.")
+extendN  = input.int(30, "Zone extend (bars)", minval = 5, maxval = 200, group = grpZ)
+
+grpF = "Filters"
+// Gold gaps over the weekend. A naive FVG check flags that gap as one giant
+// imbalance. We reject any FVG taller than this multiple of ATR.
+atrLen   = input.int(14, "ATR length", minval = 1, group = grpF)
+maxFvgX  = input.float(4.0, "Max FVG height (x ATR)", minval = 0.5, step = 0.5, group = grpF,
+     tooltip = "Rejects weekend-gap false signals on Gold.")
+
+grpC = "Colors"
+bullC = input.color(color.new(#26a69a, 75), "Bullish", group = grpC)
+bearC = input.color(color.new(#ef5350, 75), "Bearish", group = grpC)
+
+atr = ta.atr(atrLen)
+
+// --------------------------- Swing detection --------------------------------
+// ta.pivothigh / ta.pivotlow return a value only AFTER a pivot is confirmed,
+// which happens `swingLen` bars later. So the real pivot sits at
+// bar_index - swingLen. This lag is normal and is NOT repainting: once a
+// swing confirms, it never changes.
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+
+var float swHigh    = na
+var float swLow     = na
+var int   swHighBar = na
+var int   swLowBar  = na
+
+if not na(ph)
+    swHigh    := ph
+    swHighBar := bar_index - swingLen
+if not na(pl)
+    swLow    := pl
+    swLowBar := bar_index - swingLen
+
+// ------------------------- Break of Structure -------------------------------
+// A BOS prints on the FIRST candle that closes beyond the last confirmed swing.
+// Closing through a prior swing high = bulls took control, and vice versa.
+bullBOS = not na(swHigh) and close > swHigh and close[1] <= swHigh
+bearBOS = not na(swLow)  and close < swLow  and close[1] >= swLow
+
+if bullBOS and showBOS
+    line.new(swHighBar, swHigh, bar_index, swHigh, xloc = xloc.bar_index,
+         color = #26a69a, style = line.style_dashed)
+    label.new(bar_index, swHigh, "BOS", style = label.style_label_down,
+         color = #26a69a, textcolor = color.white, size = size.tiny)
+if bearBOS and showBOS
+    line.new(swLowBar, swLow, bar_index, swLow, xloc = xloc.bar_index,
+         color = #ef5350, style = line.style_dashed)
+    label.new(bar_index, swLow, "BOS", style = label.style_label_up,
+         color = #ef5350, textcolor = color.white, size = size.tiny)
+
+// ---------------------- Helper: keep zone arrays small ----------------------
+// Boxes live forever unless we delete them. This trims the oldest box once we
+// exceed the user's limit, so the chart never gets cluttered or hits the cap.
+trimBoxes(box[] arr) =>
+    while array.size(arr) > maxZones
+        box old = array.shift(arr)
+        box.delete(old)
+
+// ----------------------------- Order Blocks ---------------------------------
+// The order block is the last opposite-colour candle BEFORE the move that
+// caused the BOS. On a bullish BOS we look back for the last bearish candle —
+// that is where institutions are assumed to have loaded longs.
+var box[] obBull = array.new<box>()
+var box[] obBear = array.new<box>()
+
+if bullBOS and showOB
+    int off = na
+    for i = 1 to swingLen
+        if close[i] < open[i]            // last bearish candle before the up-move
+            off := i
+            break
+    if not na(off)
+        b = box.new(bar_index[off], high[off], bar_index + extendN, low[off],
+             border_color = #26a69a, bgcolor = bullC, xloc = xloc.bar_index)
+        array.push(obBull, b)
+        trimBoxes(obBull)
+
+if bearBOS and showOB
+    int off = na
+    for i = 1 to swingLen
+        if close[i] > open[i]            // last bullish candle before the down-move
+            off := i
+            break
+    if not na(off)
+        b = box.new(bar_index[off], high[off], bar_index + extendN, low[off],
+             border_color = #ef5350, bgcolor = bearC, xloc = xloc.bar_index)
+        array.push(obBear, b)
+        trimBoxes(obBear)
+
+// --------------------------- Fair Value Gaps --------------------------------
+// A 3-candle imbalance: price moved so fast that candle 2 left a gap between
+// candle 1 and candle 3. Bullish FVG = current low is above the high from two
+// bars ago. We reject gaps taller than maxFvgX * ATR (weekend-gap filter).
+var box[] fvgBull = array.new<box>()
+var box[] fvgBear = array.new<box>()
+
+bullFVG = low  > high[2] and (low - high[2]) < atr * maxFvgX
+bearFVG = high < low[2]  and (low[2] - high) < atr * maxFvgX
+
+if bullFVG and showFVG
+    b = box.new(bar_index[2], low, bar_index + extendN, high[2],
+         border_color = color.new(#26a69a, 40), bgcolor = bullC, xloc = xloc.bar_index)
+    array.push(fvgBull, b)
+    trimBoxes(fvgBull)
+
+if bearFVG and showFVG
+    b = box.new(bar_index[2], low[2], bar_index + extendN, high,
+         border_color = color.new(#ef5350, 40), bgcolor = bearC, xloc = xloc.bar_index)
+    array.push(fvgBear, b)
+    trimBoxes(fvgBear)
+
+// ------------------------------- Alerts --------------------------------------
+alertcondition(bullBOS, "Bullish BOS", "Quant SMC: bullish break of structure")
+alertcondition(bearBOS, "Bearish BOS", "Quant SMC: bearish break of structure")
